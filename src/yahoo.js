@@ -147,6 +147,31 @@ export async function getStockDetail(tickerSymbol) {
   };
 }
 
+// Historical daily/intraday candles for one ticker — powers moving averages, RSI,
+// and multi-timeframe trend on the client. Same unauthenticated chart endpoint
+// used for search, so no crumb/cookie dance needed here.
+export async function getChartHistory(tickerSymbol, range = '1y', interval = '1d') {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(tickerSymbol)}?range=${range}&interval=${interval}`;
+  const res = await fetch(url, { headers: { 'User-Agent': UA } });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const result = data?.chart?.result?.[0];
+  if (!result) return null;
+  const ts = result.timestamp || [];
+  const q = result.indicators.quote[0];
+  const closes = [], highs = [], lows = [], volumes = [], timestamps = [];
+  for (let i = 0; i < ts.length; i++) {
+    if (q.close[i] != null) {
+      closes.push(q.close[i]);
+      highs.push(q.high[i]);
+      lows.push(q.low[i]);
+      volumes.push(q.volume[i]);
+      timestamps.push(ts[i]);
+    }
+  }
+  return { closes, highs, lows, volumes, timestamps };
+}
+
 // Batch quote for /stock/list — one HTTP call for every symbol. No sector/industry
 // here (Yahoo's batch quote endpoint doesn't carry it); use /stock for that.
 export async function getQuoteBatch(tickerSymbols) {
