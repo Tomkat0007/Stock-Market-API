@@ -8,12 +8,20 @@ import {
   formatRatio,
   searchInCache,
 } from './format.js';
-import { searchYahoo, searchYahooDirect, tryNseAutocomplete, getStockDetail, getQuoteBatch } from './yahoo.js';
+import { searchYahoo, searchYahooDirect, tryNseAutocomplete, getStockDetail, getQuoteBatch, getChartHistory } from './yahoo.js';
+
+// Wide-open CORS: this API has no auth/session state to protect, and it's meant to be
+// called directly from browser-based tools (dashboards, this repo's own client, etc.).
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+};
 
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), {
     status,
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...CORS_HEADERS },
   });
 
 const timestamp = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
@@ -233,6 +241,108 @@ async function handleStockList(url) {
   });
 }
 
+async function handleHistory(url) {
+  const symbolInput = (url.searchParams.get('symbol') || '').toUpperCase();
+  if (!symbolInput) {
+    return json(
+      {
+        status: 'error',
+        message: 'Please provide a stock symbol using ?symbol=STOCKNAME',
+        examples: ['/history?symbol=RELIANCE&range=1y&interval=1d', '/history?symbol=TCS&range=5d&interval=15m'],
+      },
+      400
+    );
+  }
+  const range = url.searchParams.get('range') || '1y';
+  const interval = url.searchParams.get('interval') || '1d';
+  const [cleanSymbol, exchangeSuffix] = determineExchange(symbolInput);
+  const tickerSymbol = `${cleanSymbol}${exchangeSuffix}`;
+
+  const history = await getChartHistory(tickerSymbol, range, interval);
+  if (!history || history.closes.length === 0) {
+    return json(
+      { status: 'error', message: `No historical data found for ${cleanSymbol} (${range}/${interval})` },
+      404
+    );
+  }
+
+  return json({
+    status: 'success',
+    symbol: cleanSymbol,
+    ticker: tickerSymbol,
+    range,
+    interval,
+    count: history.closes.length,
+    timestamps: history.timestamps,
+    closes: history.closes,
+    highs: history.highs,
+    lows: history.lows,
+    volumes: history.volumes,
+    timestamp: timestamp(),
+  });
+}
+
+// Full list of NSE-listed equities, straight from NSE's own published master file
+// (not a live quote endpoint — just the static symbol/company/ISIN list they publish).
+// Cached in module scope so it survives across requests within the same warm isolate.
+let universeCache = { data: null, fetchedAt: 0 };
+const UNIVERSE_URL = 'https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv';
+const UNIVERSE_TTL_MS = 12 * 60 * 60 * 1000; // 12h — this list changes rarely (new listings/delistings only)
+
+function parseEquityCsv(text) {
+  const lines = text.trim().split(/\r?\n/);
+  const header = lines[0].split(',').map((h) => h.trim().toUpperCase());
+  const symIdx = header.indexOf('SYMBOL');
+  const nameIdx = header.indexOf('NAME OF COMPANY');
+  const seriesIdx = header.indexOf(' SERIES') !== -1 ? header.indexOf(' SERIES') : header.indexOf('SERIES');
+  const isinIdx = header.findIndex((h) => h.includes('ISIN'));
+  const dateIdx = header.findIndex((h) => h.includes('DATE OF LISTING'));
+
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(',');
+    if (cols.length < 2) continue;
+    const symbol = (cols[symIdx] || '').trim();
+    if (!symbol) continue;
+    rows.push({
+      symbol,
+      company_name: (cols[nameIdx] || '').trim(),
+      series: (cols[seriesIdx] || '').trim(),
+      isin: isinIdx !== -1 ? (cols[isinIdx] || '').trim() : null,
+      listing_date: dateIdx !== -1 ? (cols[dateIdx] || '').trim() : null,
+    });
+  }
+  return rows;
+}
+
+async function handleUniverse(url) {
+  const seriesFilter = (url.searchParams.get('series') || 'EQ').toUpperCase();
+  const now = Date.now();
+  if (!universeCache.data || now - universeCache.fetchedAt > UNIVERSE_TTL_MS) {
+    try {
+      const res = await fetch(UNIVERSE_URL, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const text = await res.text();
+      universeCache = { data: parseEquityCsv(text), fetchedAt: now };
+    } catch (err) {
+      if (!universeCache.data) {
+        return json({ status: 'error', message: `Could not fetch NSE's company list: ${err.message}` }, 502);
+      }
+      // fall through and serve stale cache rather than fail outright
+    }
+  }
+  const all = universeCache.data;
+  const filtered = seriesFilter === 'ALL' ? all : all.filter((r) => r.series === seriesFilter);
+  return json({
+    status: 'success',
+    series_filter: seriesFilter,
+    total: filtered.length,
+    cached_at: new Date(universeCache.fetchedAt).toISOString(),
+    companies: filtered,
+    note: 'Symbol/company/ISIN list from NSE\u2019s own published EQUITY_L.csv \u2014 static reference data, not live prices. Use /stock/list for live quotes.',
+  });
+}
+
 function handleSymbols() {
   const symbolsList = Object.entries(NSE_SYMBOLS_CACHE).map(([company, symbol]) => ({
     search_term: company,
@@ -248,6 +358,81 @@ function handleSymbols() {
     total_symbols: symbolsList.length,
     symbols: symbolsList,
     note: 'Most stocks are available on both NSE (.NS) and BSE (.BO). Default is NSE.',
+  });
+}
+
+// Generic secure proxy to stock.indianapi.in. The API key lives only as a Worker secret
+// (set via `wrangler secret put INDIAN_API_KEY` or the dashboard) and is never sent to
+// the browser. The browser calls /india/<path> on THIS worker; this worker adds the key
+// and forwards to the real service.
+const INDIAN_API_BASE = 'https://stock.indianapi.in';
+
+async function handleIndiaProxy(url, env) {
+  if (!env.INDIAN_API_KEY) {
+    return json(
+      {
+        status: 'error',
+        message:
+          'INDIAN_API_KEY secret is not set on this Worker. Run `wrangler secret put INDIAN_API_KEY` (or add it in the Cloudflare dashboard under Settings > Variables and Secrets) with a key from indianapi.in.',
+      },
+      501
+    );
+  }
+  const upstreamPath = url.pathname.replace(/^\/india/, '') || '/';
+  const upstreamUrl = INDIAN_API_BASE + upstreamPath + url.search;
+  let res;
+  try {
+    res = await fetch(upstreamUrl, { headers: { 'X-API-Key': env.INDIAN_API_KEY } });
+  } catch (err) {
+    return json({ status: 'error', message: `Could not reach Indian API: ${err.message}` }, 502);
+  }
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return json({ status: 'error', message: 'Non-JSON response from Indian API', raw: text.slice(0, 300) }, 502);
+  }
+  return new Response(JSON.stringify(data), {
+    status: res.status,
+    headers: { 'content-type': 'application/json', ...CORS_HEADERS },
+  });
+}
+
+// Second secure proxy, same pattern as /india: keeps the Parse API key server-side only.
+// Parse's NSE India API (parse.bot marketplace) — option chains, market status,
+// gainers/losers, and other endpoints Yahoo/indianapi.in don't cover well.
+const PARSE_API_BASE = 'https://api.parse.bot/scraper/d621017b-ba03-43b8-816b-e5167cb6ec16';
+
+async function handleParseProxy(url, env) {
+  if (!env.PARSE_API_KEY) {
+    return json(
+      {
+        status: 'error',
+        message:
+          'PARSE_API_KEY secret is not set on this Worker. Run `wrangler secret put PARSE_API_KEY` (or add it in the Cloudflare dashboard) with a key from parse.bot.',
+      },
+      501
+    );
+  }
+  const upstreamPath = url.pathname.replace(/^\/parse/, '') || '/';
+  const upstreamUrl = PARSE_API_BASE + upstreamPath + url.search;
+  let res;
+  try {
+    res = await fetch(upstreamUrl, { headers: { 'X-API-Key': env.PARSE_API_KEY } });
+  } catch (err) {
+    return json({ status: 'error', message: `Could not reach Parse API: ${err.message}` }, 502);
+  }
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return json({ status: 'error', message: 'Non-JSON response from Parse API', raw: text.slice(0, 300) }, 502);
+  }
+  return new Response(JSON.stringify(data), {
+    status: res.status,
+    headers: { 'content-type': 'application/json', ...CORS_HEADERS },
   });
 }
 
@@ -274,6 +459,21 @@ function handleHome() {
       '/stock': { description: 'Get single stock details', method: 'GET', parameters: 'symbol=STOCK_SYMBOL, res=num|val (optional)' },
       '/stock/list': { description: 'Get multiple stock details (batched, no sector field)', method: 'GET', parameters: 'symbols=STOCK1,STOCK2, res=num|val (optional)' },
       '/symbols': { description: 'List all available cached symbols', method: 'GET' },
+      '/universe': {
+        description: 'Full list of NSE-listed companies (symbol, name, ISIN) from NSE\u2019s own published EQUITY_L.csv. Reference data, not live prices.',
+        method: 'GET',
+        parameters: 'series=EQ (default, main board) | ALL',
+      },
+      '/india/*': {
+        description:
+          'Secure proxy to stock.indianapi.in (search, trending, ipo, news, mutual_funds, commodities, historical_data, corporate_actions, and more). Requires the INDIAN_API_KEY secret to be set on this Worker. Call it as /india/<path-from-indianapi-docs>, e.g. /india/ipo, /india/trending, /india/stock?name=Reliance.',
+        method: 'GET',
+      },
+      '/parse/*': {
+        description:
+          'Secure proxy to Parse\u2019s NSE India API (option chains, market status, gainers/losers, 52-week movers, financials, corporate announcements, and more). Requires the PARSE_API_KEY secret to be set on this Worker. Call it as /parse/<endpoint>, e.g. /parse/get_market_status, /parse/get_option_chain?symbol=RELIANCE&type=Equity.',
+        method: 'GET',
+      },
     },
     response_formats: {
       'res=num': 'Simple numeric values',
@@ -283,9 +483,18 @@ function handleHome() {
 }
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
     const url = new URL(request.url);
     try {
+      if (url.pathname.startsWith('/india/') || url.pathname === '/india') {
+        return await handleIndiaProxy(url, env);
+      }
+      if (url.pathname.startsWith('/parse/') || url.pathname === '/parse') {
+        return await handleParseProxy(url, env);
+      }
       switch (url.pathname) {
         case '/':
           return handleHome();
@@ -295,8 +504,12 @@ export default {
           return await handleStock(url);
         case '/stock/list':
           return await handleStockList(url);
+        case '/history':
+          return await handleHistory(url);
         case '/symbols':
           return handleSymbols();
+        case '/universe':
+          return await handleUniverse(url);
         default:
           return json({ status: 'error', message: 'Not found' }, 404);
       }
